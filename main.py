@@ -8,12 +8,12 @@ import wave
 from queue import Queue
 from time import sleep
 
-import numpy as np
-import pyaudio
-import speech_recognition as sr
-from faster_whisper import WhisperModel
-from piper import PiperVoice
 import requests
+import numpy as np
+import speech_recognition as sr # Read MIC
+from faster_whisper import WhisperModel # STT
+from piper import PiperVoice # TTS
+import pyaudio # Read aloud from SPEAKERS
 
 
 WHISPER_LANGUAGE = "en"
@@ -69,6 +69,7 @@ def read_mic(
     except Exception as e:
         print(f"Failed to start microphone stream: {e}")
         return
+
 
 def main():
     global transcribe
@@ -291,7 +292,7 @@ def main():
                             "http://localhost:11434/api/chat",
                             headers={"Content-Type": "application/json"}, 
                             json={
-                                "model": "smollm2:135m",
+                                "model": "gemma2:2b",
                             "messages": messages,
                             "stream": False,
                             },
