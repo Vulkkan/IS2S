@@ -1,362 +1,282 @@
-# System doesn't interrupt LLM inference, it only interrupts TTS playback.
-
-import queue
+# Volume-based interruption - speak louder than bot to interrupt it.
 import re
-import threading
 import time
 import wave
+import queue
+import threading
 from queue import Queue
 from time import sleep
-
-import requests
+from enum import Enum
 import numpy as np
-import speech_recognition as sr # Read MIC
-from faster_whisper import WhisperModel # STT
-from piper import PiperVoice # TTS
-import pyaudio # Read aloud from SPEAKERS
+import pyaudio
+import requests
+import speech_recognition as sr
+from piper import PiperVoice
+from faster_whisper import WhisperModel
+from collections import deque
+import webrtcvad
 
 
-WHISPER_LANGUAGE = "en"
+# ================== CONFIG ==================
+MODEL: str = 'smollm2:135m' # LLM
+DEFAULT_MIC: str = "pipewire"  # LINUX, change to the default from Mac (Built-in microphone)
+ENERGY_THRESHOLD: int = 1000 # When voice is raised above this threshold, interruption occurs. Keep the volume lower and speak louder.
+
+# ==== Whisper (TTS) ==== #
 WHISPER_THREADS: int = 4
-LENGHT_IN_SEC: int = 5
+LENGTH_IN_SEC: int = 5
 MAX_SENTENCE_CHARACTERS = 80
 RECORD_TIMEOUT: int = 2
-ENERGY_THRESHOLD: int = 1000
-DEFAULT_MIC = "pipewire" # LINUX
+
+# === Interruption / VAD ===
+VAD_FRAME_MS: int = 20           # 10/20/30 ms supported
+VAD_SENSITIVITY: int = 2         # 0=least, 3=most aggressive
+BARGE_IN_MS: int = 250           # how long user must speak to interrupt
 
 
-def read_mic(
-    audio_queue: Queue,
-    default_microphone=None,
-    energy_threshold=None,
-    record_timeout=None,
-):
-    recorder = sr.Recognizer()
-    recorder.energy_threshold = energy_threshold
-    recorder.dynamic_energy_threshold = False
+class Mode(Enum):
+    LISTENING: int = 1
+    SPEAKING: int = 2
 
-    mic_index = None
-
-    mic_names = sr.Microphone.list_microphone_names()
-    
-    # Match by index/partial name and Assign mic (LINUX)
-    for index, name in enumerate(mic_names):
-        if str(default_microphone) in str(index) or default_microphone in name:
-            mic_index = index
-            break
-
-    if mic_index is None:
-        print(f"Microphone '{default_microphone}' not found.")
-        return
-    else:
-        source = sr.Microphone(device_index=mic_index, sample_rate=16000)
-
-    with source:
-        recorder.adjust_for_ambient_noise(source, duration=1.5)
-
-    def record_callback(_, audio: sr.AudioData) -> None:
-        data = audio.get_raw_data()
-        audio_queue.put(data)
-        transcribe.set()
-
-    try:
-        stop_listening = recorder.listen_in_background(
-            source, record_callback, phrase_time_limit=record_timeout,
+class AudioTranscriber:
+    def __init__(self):
+        self.audio_model = WhisperModel(
+            model_size_or_path='tiny.en',
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=WHISPER_THREADS,
+            download_root="./models",
         )
-        print("=======Wait for model speech and start talk after hearing it.==========")
-        return stop_listening
+        self.transcribe = threading.Event()
+        self.thread_terminate = threading.Event()
+        self.audio_queue = Queue()
+        self.length_queue = Queue(maxsize=LENGTH_IN_SEC)
+        self.transcription_queue = Queue()
+        self.vad = webrtcvad.Vad(VAD_SENSITIVITY)
+        self.mode_state = Mode.LISTENING
+        self.voice_window = deque(maxlen=BARGE_IN_MS // VAD_FRAME_MS)
 
-    except Exception as e:
-        print(f"Failed to start microphone stream: {e}")
-        return
+    def process_audio_segment(self, audio_data):
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self.audio_model.transcribe(audio_np, language='en', beam_size=5)
+        return "".join(segment.text for segment in segments)
 
+    def clear_queues(self):
+        with self.length_queue.mutex:
+            self.length_queue.queue.clear()
+        while not self.audio_queue.empty():
+            self.audio_queue.get()
 
-def main():
-    global transcribe
-
-    audio_model = WhisperModel(
-        model_size_or_path= 'tiny.en',
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=WHISPER_THREADS,
-        download_root="./models",
-    )
-
-    record_timeout = RECORD_TIMEOUT
-
-    audio_queue = Queue()
-    length_queue = Queue(maxsize=LENGHT_IN_SEC)
-    transcription_queue = Queue()
-
-    def consumer_thread(transcribe: threading.Event, thread_terminate: threading.Event):
+    def consumer_loop(self):
         transcription = ""
-        pause_count = 0 
-        current_openaithread_id = None
-        openaithread = None
+        pause_count = 0
         stored_transcription = []
-        transcribe.set()
 
-        while True:
-            if length_queue.qsize() >= LENGHT_IN_SEC:
-                with length_queue.mutex:
-                    length_queue.queue.clear()
-                    stored_transcription.append(transcription)
-                    transcription = ""
-                    print()
-
-            if thread_terminate.is_set():
-                print("Stopping the main thread and signal to stop subthread...")
-                break
-
-            if current_openaithread_id is None:
-                openaithread = threading.Thread(
-                    target=chat_thread, args=(transcribe, thread_terminate)
-                )
-                openaithread.start()
-                current_openaithread_id = openaithread.native_id
-                prepare_start_time = time.time()
+        while not self.thread_terminate.is_set():
+            if self.length_queue.qsize() >= LENGTH_IN_SEC:
+                self.clear_queues()
+                stored_transcription.append(transcription)
+                transcription = ""
+                print()
 
             try:
-                audio_data = audio_queue.get(timeout=2)
-                length_queue.put(audio_data)
-                audio_queue.task_done()
+                audio_data = self.audio_queue.get(timeout=2)
+                self.length_queue.put(audio_data)
+                self.audio_queue.task_done()
 
-                if not transcribe.is_set():
-                    transcribe.set()
+                if not self.transcribe.is_set():
+                    self.transcribe.set()
 
-                audio_data_to_process = b""
-                for i in range(length_queue.qsize()):
-                    audio_data_to_process += length_queue.queue[i]
-
-                audio_np = (
-                    np.frombuffer(audio_data_to_process, dtype=np.int16).astype(np.float32) / 32768.0
-                )
-
-                segments, _ = audio_model.transcribe(
-                    audio_np, language=WHISPER_LANGUAGE, beam_size=5
-                )
-
-                transcription = ""
-                for s in segments:
-                    transcription += s.text
-
+                audio_data_to_process = b"".join(list(self.length_queue.queue))
+                transcription = self.process_audio_segment(audio_data_to_process)
                 transcription = re.sub(r"\s\s+", "", transcription)
 
-                if transcription == "":
-                    pause_count += 1
-                else:
+                if transcription:
                     print(transcription, end="\r", flush=True)
                     pause_count = 0
+                else:
+                    pause_count += 1
 
             except queue.Empty:
                 pause_count += 1
 
             if pause_count >= 1:
-                if transcribe.is_set():
-                    transcribe.clear()
-                    if transcription != "":
-                        stored_transcription.append(transcription)
-                    audio_data_to_process = b""
-                    while not audio_queue.empty():
-                        audio_data_to_process += audio_queue.get(timeout=1)
-                    audio_np = (
-                        np.frombuffer(audio_data_to_process, dtype=np.int16).astype(np.float32) / 32768.0
-                    )
-                    segments, _ = audio_model.transcribe(
-                        audio_np, language=WHISPER_LANGUAGE, beam_size=5
-                    )
+                if self.transcribe.is_set():
+                    self.handle_pause(transcription, stored_transcription)
                     transcription = ""
-                    for s in segments:
-                        transcription += s.text
-                    transcription = re.sub(r"\s\s+", "", transcription)
-                    if transcription != "":
-                        stored_transcription.append(transcription)
-                    transcription_queue.put("".join(stored_transcription))
-                    with length_queue.mutex:
-                        length_queue.queue.clear()
-                    stored_transcription = []
 
-            else:
-                if not transcribe.is_set():
-                    print("Transcribing...")
-                    transcribe.set()
+    def handle_pause(self, transcription, stored_transcription):
+        self.transcribe.clear()
+        if transcription:
+            stored_transcription.append(transcription)
 
-                continue
+        audio_data_to_process = b""
+        while not self.audio_queue.empty():
+            audio_data_to_process += self.audio_queue.get(timeout=1)
 
-        if thread_terminate.is_set():
-            print("===In consumer terminating process===")
-            if transcription != "":
-                stored_transcription.append(transcription)
-            audio_data_to_process = b""
-            while not audio_queue.empty():
-                audio_data_to_process += audio_queue.get(timeout=1)
-            audio_np = (
-                np.frombuffer(audio_data_to_process, dtype=np.int16).astype(np.float32)
-                / 32768.0
-            )
-            segments, _ = audio_model.transcribe(
-                audio_np, language=WHISPER_LANGUAGE, beam_size=5
-            )
-            transcription = ""
-            for s in segments:
-                transcription += s.text
-            transcription = re.sub(r"\s\s+", "", transcription)
-            if transcription != "":
-                stored_transcription.append(transcription)
-            transcription_queue.put("".join(stored_transcription))
-            if current_openaithread_id is not None:
-                print("Waiting for openai thread to be closed...")
-                openaithread.join()
-                
-        print("consumer thread is closed")
+        if audio_data_to_process:
+            final_transcription = self.process_audio_segment(audio_data_to_process)
+            final_transcription = re.sub(r"\s\s+", "", final_transcription)
+            if final_transcription:
+                stored_transcription.append(final_transcription)
 
-    def chat_thread(transcribe: threading.Event, thread_terminate: threading.Event):
-        voice = PiperVoice.load("models/piper/en_GB-alba-medium.onnx")
+        self.transcription_queue.put("".join(stored_transcription))
+        self.clear_queues()
 
-        output_file = "output.wav"
-        response_queue = Queue()
-        tts_queue = Queue()
-
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a conversational chatbot.",
-            },
+class ChatAssistant:
+    def __init__(self):
+        self.voice = PiperVoice.load("models/piper/en_GB-alba-medium.onnx")
+        self.output_file = "output.wav"
+        self.messages = [
+            {"role": "system", "content": "You are a conversational chatbot."},
         ]
+        self.pyaudio_instance = pyaudio.PyAudio()
 
-        # Initialize PyAudio
-        p = pyaudio.PyAudio()
+    def synthesize_speech(self, text):
+        with wave.open(self.output_file, "wb") as wav_file:
+            self.voice.synthesize_wav(text, wav_file)
 
-        def form_message_from_transcription(transcription: str) -> None:
-            messages.append({"role": "user", "content": transcription})
-
-        def form_message_from_response(response: str) -> None:
-            messages.append({"role": "assistant", "content": response})
-
-        def synthesize_with_piper(text):
-            with wave.open(output_file, "wb") as wav_file:
-                voice.synthesize_wav(text, wav_file)
-
-        def response_handler(history):
-            wf = wave.open(output_file, "rb")
-
-            def callback(in_data, frame_count, time_info, status):
-                if transcribe.is_set() or thread_terminate.is_set():
-                    return (None, pyaudio.paComplete)
-                data = wf.readframes(frame_count)
-                return (data, pyaudio.paContinue if data else pyaudio.paComplete)
-
-            while not response_queue.empty() and not transcribe.is_set():
-                if not tts_queue.empty():
-                    response = response_queue.get()
-                    tts_queue.get()
-                    wf.rewind()
-
-                    stream = p.open(
-                        format=p.get_format_from_width(wf.getsampwidth()),
-                        channels=wf.getnchannels(),
-                        rate=wf.getframerate(),
-                        output=True,
-                        stream_callback=callback,
-                    )
-                    stream.start_stream()
-
-                    while stream.is_active():
-                        sleep(0.5)
-                        if thread_terminate.is_set():
-                            stream.stop_stream()
-                            break
-                    stream.stop_stream()
-                    stream.close()
-
-                    wf.close() # *after* playback is fully done
-
-                    history += response
-                    form_message_from_response(response)
-
-        while True:
-            sleep(1)
-            if thread_terminate.is_set():
-                p.terminate()
+    def play_audio(self, transcribe_event, terminate_event):
+        wf = wave.open(self.output_file, "rb")
+        
+        def callback(in_data, frame_count, time_info, status):
+            if transcribe_event.is_set() or terminate_event.is_set():
+                return (None, pyaudio.paComplete)
+            data = wf.readframes(frame_count)
+            return (data, pyaudio.paContinue if data else pyaudio.paComplete)
+        
+        stream = self.pyaudio_instance.open(
+            format=self.pyaudio_instance.get_format_from_width(wf.getsampwidth()),
+            channels=wf.getnchannels(),
+            rate=wf.getframerate(),
+            output=True,
+            stream_callback=callback,
+        )
+        stream.start_stream()
+        while stream.is_active():
+            sleep(0.1)
+            if terminate_event.is_set():
                 break
-            if transcribe.is_set():
+        stream.stop_stream()
+        stream.close()
+        wf.close()
+
+    def get_llm_response(self, user_input):
+        self.messages.append({"role": "user", "content": user_input})
+        
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/chat",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": MODEL,
+                    "messages": self.messages,
+                    "stream": False,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except Exception as e:
+            print(f"Ollama error: {e}")
+            return f"[Ollama error: {e}]"
+
+    def chat_loop(self, transcription_queue, transcribe_event, terminate_event):
+        while not terminate_event.is_set():
+            sleep(1)
+            if transcribe_event.is_set():
                 continue
 
             try:
                 if not transcription_queue.empty():
                     user_input = transcription_queue.get(timeout=1)
-                    form_message_from_transcription(user_input)
-
-                    try:
-                        response = requests.post(
-                            "http://localhost:11434/api/chat",
-                            headers={"Content-Type": "application/json"}, 
-                            json={
-                                "model": "gemma2:2b",
-                            "messages": messages,
-                            "stream": False,
-                            },
-                            timeout=60,
-                        )
-                        response.raise_for_status()
-                        bot_reply = response.json()["message"]["content"]
-                    except Exception as e:
-                        print(f"Ollama error: {e}")
-                        bot_reply = f"[Ollama error: {e}]"
-
-                    # TTS with Piper
-                    synthesize_with_piper(bot_reply)
-                    tts_queue.put(1)
-                    response_queue.put(bot_reply)
-
+                    bot_reply = self.get_llm_response(user_input)
+                    
+                    self.synthesize_speech(bot_reply)
                     print("========== Ollama is answering ==========")
-                    response_handler("")
+                    
+                    self.play_audio(transcribe_event, terminate_event)
+                    self.messages.append({"role": "assistant", "content": bot_reply})
                     transcription_queue.task_done()
-                    response_queue.task_done()
 
             except Exception as e:
                 print("Exception occurred:", e)
                 continue
 
-        print("Ollama thread terminated.")
+        self.pyaudio_instance.terminate()
 
+class MicrophoneHandler:
+    def __init__(self, audio_queue, energy_threshold=ENERGY_THRESHOLD, default_mic=DEFAULT_MIC):
+        self.audio_queue = audio_queue
+        self.energy_threshold = energy_threshold
+        self.default_mic = default_mic
+        self.recorder = sr.Recognizer()
+        
+        self.recorder.energy_threshold = energy_threshold
+        self.recorder.dynamic_energy_threshold = False
 
-    transcribe = threading.Event()
-    thread_terminate = threading.Event()
-    stop_listening = None
-    audio_thread = None
-    stop_listening = None
+    def find_microphone(self):
+        mic_names = sr.Microphone.list_microphone_names()
+        for index, name in enumerate(mic_names):
+            if str(self.default_mic) in str(index) or self.default_mic in name:
+                return index
+        print(f"Microphone '{self.default_mic}' not found.")
+        return None
 
-    stop_listening = read_mic(
-        audio_queue, DEFAULT_MIC, ENERGY_THRESHOLD, record_timeout
+    def record_callback(self, _, audio: sr.AudioData):
+        data = audio.get_raw_data()
+        self.audio_queue.put(data)
+
+    def start_listening(self, transcribe_event):
+        mic_index = self.find_microphone()
+        if mic_index is None:
+            return None
+
+        source = sr.Microphone(device_index=mic_index, sample_rate=16000)
+        with source:
+            self.recorder.adjust_for_ambient_noise(source, duration=1.5)
+
+        try:
+            return self.recorder.listen_in_background(
+                source, self.record_callback, phrase_time_limit=RECORD_TIMEOUT
+            )
+        except Exception as e:
+            print(f"Failed to start microphone stream: {e}")
+            return None
+
+def main():
+    transcriber = AudioTranscriber()
+    assistant = ChatAssistant()
+    mic_handler = MicrophoneHandler(transcriber.audio_queue)
+
+    print("=======Wait for model speech and start talk after hearing it.==========")
+    
+    stop_listening = mic_handler.start_listening(transcriber.transcribe)
+    if not stop_listening:
+        return
+
+    consumer_thread = threading.Thread(
+        target=transcriber.consumer_loop
     )
+    consumer_thread.start()
 
-    consumer = threading.Thread(
-        target=consumer_thread, args=(transcribe, thread_terminate)
+    chat_thread = threading.Thread(
+        target=assistant.chat_loop,
+        args=(transcriber.transcription_queue, transcriber.transcribe, transcriber.thread_terminate)
     )
-    consumer.start()
+    chat_thread.start()
 
     try:
-        while consumer.is_alive():
+        while consumer_thread.is_alive():
             sleep(3)
-            continue
-
     except KeyboardInterrupt:
-        print("\nKeyboardInterrupt occurs, threads are running?", consumer.is_alive())
-        
+        print("\nKeyboardInterrupt occurs, stopping threads...")
+        transcriber.thread_terminate.set()
         stop_listening(wait_for_stop=False)
-        thread_terminate.set()
-        consumer.join()
-        print()
+        consumer_thread.join()
+        chat_thread.join()
 
-    finally:
-        print()
-        while consumer.is_alive():
-            print("Consumer thread is still running...")
-            sleep(3)
-        print("Exiting...")
     print("The program stops.")
-    
-    
+
 if __name__ == "__main__":
     main()
